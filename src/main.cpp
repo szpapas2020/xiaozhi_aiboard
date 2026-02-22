@@ -290,7 +290,7 @@ void drawSpectrum()
   }
 
   // 只清除频谱区域（标题下方到基线）
-  display.fillRect(SPECTRUM_X - 5, SPECTRUM_Y + 5,
+  display.fillRect(SPECTRUM_X - 5, SPECTRUM_Y,
                    SPECTRUM_WIDTH + 10, SPECTRUM_HEIGHT + 30, TFT_BLACK);
 
   // 绘制基线
