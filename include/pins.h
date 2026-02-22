@@ -45,8 +45,8 @@
 
 // ============ 扩展接口 ============
 // I2C 接口
-#define PIN_I2C_SDA 8 // I2C SDA
-#define PIN_I2C_SCL 9 // I2C SCL
+#define PIN_I2C_SDA 41 // I2C SDA
+#define PIN_I2C_SCL 42 // I2C SCL
 
 // UART 接口 (MX1.25-4P)
 // #define PIN_UART_TX 1 // UART TX
