@@ -1,6 +1,6 @@
 /**
- * ESP32-S3 AI Board - 屏幕显示 + I2S 音频问候
- * 显示问候语并播放向上音调
+ * ESP32-S3 AI Board - 麦克风 FFT 频谱测试
+ * 显示声音 FFT 频谱并播放问候音
  */
 
 #include <Arduino.h>
@@ -10,24 +10,45 @@
 
 LGFX display;
 
-// I2S 引脚定义
+// ============ I2S 麦克风配置 ============
+#define MIC_I2S_PORT I2S_NUM_1
+#define MIC_BCLK_PIN PIN_MIC_SCK  // 5
+#define MIC_DATA_PIN PIN_MIC_DATA // 6
+#define MIC_WS_PIN PIN_MIC_WS     // 4
+
+// I2S 麦克风配置
+static const i2s_port_t mic_i2s_port = I2S_NUM_1;
+#define MIC_SAMPLE_RATE 16000
+#define SAMPLE_COUNT 256 // FFT 采样点数 (必须是 2 的幂)
+
+// FFT 相关
+#define FFT_SIZE SAMPLE_COUNT
+double vReal[SAMPLE_COUNT];
+double vImag[SAMPLE_COUNT];
+int16_t samples[SAMPLE_COUNT];
+
+// ============ I2S 音频输出配置 ============
 #define I2S_BCLK_PIN PIN_I2S_BCLK // 15
 #define I2S_LRCK_PIN PIN_I2S_LRCK // 16
 #define I2S_DOUT_PIN PIN_I2S_DIN  // 7
 
-// I2S 配置
-static const i2s_port_t i2s_port = I2S_NUM_0;
+static const i2s_port_t dac_i2s_port = I2S_NUM_0;
+#define DAC_SAMPLE_RATE 16000
 
-// 音频参数
-#define SAMPLE_RATE 16000
+// ============ 频谱显示参数 ============
+#define SPECTRUM_WIDTH 300  // 频谱宽度（几乎占满屏幕）
+#define SPECTRUM_HEIGHT 120 // 频谱高度
+#define SPECTRUM_X 10       // X 起始位置
+#define SPECTRUM_Y 25       // Y 起始位置
+#define NUM_BARS 32         // 显示的频带数量
 
 // 简单的正弦波生成（向上音调）
 void playTone(uint16_t frequency, uint32_t duration)
 {
   int16_t sample;
-  uint32_t samples_count = (SAMPLE_RATE * duration) / 1000;
+  uint32_t samples_count = (DAC_SAMPLE_RATE * duration) / 1000;
   float phase = 0.0;
-  float phase_increment = (2.0 * PI * frequency) / SAMPLE_RATE;
+  float phase_increment = (2.0 * PI * frequency) / DAC_SAMPLE_RATE;
 
   for (uint32_t i = 0; i < samples_count; i++)
   {
@@ -42,11 +63,11 @@ void playTone(uint16_t frequency, uint32_t duration)
     sample32 |= ((uint32_t)sample << 16);
 
     size_t bytes_written;
-    i2s_write(i2s_port, &sample32, sizeof(sample32), &bytes_written, portMAX_DELAY);
+    i2s_write(dac_i2s_port, &sample32, sizeof(sample32), &bytes_written, portMAX_DELAY);
   }
 }
 
-// 播放向上滑音（从低频到高频）
+// 播放向上滑音
 void playSlideUp()
 {
   uint32_t duration_per_step = 50;
@@ -60,11 +81,11 @@ void playSlideUp()
   }
 }
 
-void setupI2S()
+void setupDAC()
 {
   i2s_config_t i2s_config = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-      .sample_rate = SAMPLE_RATE,
+      .sample_rate = DAC_SAMPLE_RATE,
       .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
       .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
       .communication_format = I2S_COMM_FORMAT_STAND_I2S,
@@ -81,19 +102,240 @@ void setupI2S()
       .data_out_num = I2S_DOUT_PIN,
       .data_in_num = I2S_PIN_NO_CHANGE};
 
-  esp_err_t ret = i2s_driver_install(i2s_port, &i2s_config, 0, NULL);
+  esp_err_t ret = i2s_driver_install(dac_i2s_port, &i2s_config, 0, NULL);
   if (ret != ESP_OK)
   {
-    Serial.printf("I2S driver install failed: %d\n", ret);
+    Serial.printf("DAC I2S driver install failed: %d\n", ret);
     return;
   }
 
-  ret = i2s_set_pin(i2s_port, &pin_config);
+  ret = i2s_set_pin(dac_i2s_port, &pin_config);
   if (ret != ESP_OK)
   {
-    Serial.printf("I2S set pin failed: %d\n", ret);
+    Serial.printf("DAC I2S set pin failed: %d\n", ret);
     return;
   }
+}
+
+void setupMIC()
+{
+  Serial.println("Setting up MIC...");
+
+  // I2S 麦克风配置 (PDM 或 I2S 模式)
+  i2s_config_t i2s_config = {
+      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+      .sample_rate = MIC_SAMPLE_RATE,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+      .dma_buf_count = 8,
+      .dma_buf_len = 1024,
+      .use_apll = false,
+      .tx_desc_auto_clear = false,
+      .fixed_mclk = 0};
+
+  i2s_pin_config_t pin_config = {
+      .bck_io_num = MIC_BCLK_PIN,
+      .ws_io_num = MIC_WS_PIN,
+      .data_out_num = I2S_PIN_NO_CHANGE,
+      .data_in_num = MIC_DATA_PIN};
+
+  esp_err_t ret = i2s_driver_install(mic_i2s_port, &i2s_config, 0, NULL);
+  if (ret != ESP_OK)
+  {
+    Serial.printf("MIC I2S driver install failed: %d\n", ret);
+    return;
+  }
+
+  ret = i2s_set_pin(mic_i2s_port, &pin_config);
+  if (ret != ESP_OK)
+  {
+    Serial.printf("MIC I2S set pin failed: %d\n", ret);
+    return;
+  }
+
+  Serial.println("MIC setup complete!");
+}
+
+// 从麦克风读取样本
+bool readMicSamples()
+{
+  size_t bytes_read;
+  esp_err_t ret = i2s_read(mic_i2s_port, samples, sizeof(samples), &bytes_read, portMAX_DELAY);
+  if (ret != ESP_OK || bytes_read < sizeof(samples))
+  {
+    return false;
+  }
+
+  // 转换为 double 并归一化
+  for (int i = 0; i < SAMPLE_COUNT; i++)
+  {
+    vReal[i] = (double)samples[i] / 32768.0;
+    vImag[i] = 0;
+  }
+
+  return true;
+}
+
+// 复数乘法
+void complexMultiply(double &a, double &b, double c, double d)
+{
+  double real = a * c - b * d;
+  double imag = a * d + b * c;
+  a = real;
+  b = imag;
+}
+
+// 位反转
+int bitReverse(int n, int bits)
+{
+  int reversed = 0;
+  for (int i = 0; i < bits; i++)
+  {
+    reversed = (reversed << 1) | (n & 1);
+    n >>= 1;
+  }
+  return reversed;
+}
+
+// 执行 FFT 并计算频谱 (使用 Cooley-Tukey 算法)
+void computeFFT()
+{
+  int bits = 8; // log2(256) = 8
+
+  // 位反转重排
+  for (int i = 0; i < SAMPLE_COUNT; i++)
+  {
+    int rev = bitReverse(i, bits);
+    if (i < rev)
+    {
+      double temp = vReal[i];
+      vReal[i] = vReal[rev];
+      vReal[rev] = temp;
+      temp = vImag[i];
+      vImag[i] = vImag[rev];
+      vImag[rev] = temp;
+    }
+  }
+
+  // Cooley-Tukey FFT
+  for (int len = 2; len <= SAMPLE_COUNT; len *= 2)
+  {
+    double angle = -2 * PI / len;
+    double wlenReal = cos(angle);
+    double wlenImag = sin(angle);
+
+    for (int i = 0; i < SAMPLE_COUNT; i += len)
+    {
+      double wReal = 1;
+      double wImag = 0;
+
+      for (int j = 0; j < len / 2; j++)
+      {
+        double uReal = vReal[i + j];
+        double uImag = vImag[i + j];
+        double vRealTemp = vReal[i + j + len / 2];
+        double vImagTemp = vImag[i + j + len / 2];
+
+        double tReal = vRealTemp * wReal - vImagTemp * wImag;
+        double tImag = vRealTemp * wImag + vImagTemp * wReal;
+
+        vReal[i + j] = uReal + tReal;
+        vImag[i + j] = uImag + tImag;
+        vReal[i + j + len / 2] = uReal - tReal;
+        vImag[i + j + len / 2] = uImag - tImag;
+
+        complexMultiply(wReal, wImag, wlenReal, wlenImag);
+      }
+    }
+  }
+
+  // 计算幅度
+  for (int i = 0; i < SAMPLE_COUNT / 2; i++)
+  {
+    vReal[i] = sqrt(vReal[i] * vReal[i] + vImag[i] * vImag[i]);
+  }
+}
+
+// 绘制频谱
+void drawSpectrum()
+{
+  // 计算每个频带的平均值
+  uint8_t barHeights[NUM_BARS];
+  int binsPerBar = (SAMPLE_COUNT / 2) / NUM_BARS;
+
+  for (int bar = 0; bar < NUM_BARS; bar++)
+  {
+    double sum = 0;
+    int start = bar * binsPerBar;
+    int end = start + binsPerBar;
+    if (end > SAMPLE_COUNT / 2)
+      end = SAMPLE_COUNT / 2;
+
+    for (int i = start; i < end; i++)
+    {
+      sum += vReal[i];
+    }
+    double avg = sum / binsPerBar;
+
+    // 线性缩放
+    int height = (int)map(avg * 1000, 0, 100, 0, SPECTRUM_HEIGHT);
+    if (height > SPECTRUM_HEIGHT)
+      height = SPECTRUM_HEIGHT;
+    if (height < 0)
+      height = 0;
+
+    barHeights[bar] = height;
+  }
+
+  // 只清除频谱区域（标题下方到基线）
+  display.fillRect(SPECTRUM_X - 5, SPECTRUM_Y + 5,
+                   SPECTRUM_WIDTH + 10, SPECTRUM_HEIGHT + 30, TFT_BLACK);
+
+  // 绘制基线
+  display.drawLine(SPECTRUM_X - 5, SPECTRUM_Y + SPECTRUM_HEIGHT,
+                   SPECTRUM_X + SPECTRUM_WIDTH + 5, SPECTRUM_Y + SPECTRUM_HEIGHT, TFT_WHITE);
+
+  // 绘制频带
+  int barWidth = SPECTRUM_WIDTH / NUM_BARS;
+  for (int bar = 0; bar < NUM_BARS; bar++)
+  {
+    int x = SPECTRUM_X + bar * barWidth;
+    int y = SPECTRUM_Y + SPECTRUM_HEIGHT - barHeights[bar];
+    int h = barHeights[bar];
+
+    // 根据高度选择颜色
+    uint16_t color;
+    if (h < 50)
+    {
+      color = TFT_GREEN;
+    }
+    else if (h < 100)
+    {
+      color = TFT_YELLOW;
+    }
+    else
+    {
+      color = TFT_RED;
+    }
+
+    display.fillRect(x + 1, y, barWidth - 2, h, color);
+  }
+
+  // 显示 RMS 音量
+  double rms = 0;
+  for (int i = 0; i < SAMPLE_COUNT; i++)
+  {
+    rms += samples[i] * samples[i];
+  }
+  rms = sqrt(rms / SAMPLE_COUNT);
+  int volume = map(rms, 0, 10000, 0, 1000); // 放大 10 倍
+  if (volume > 100)
+    volume = 100;
+
+  display.setCursor(10, 155);
+  display.printf("Volume: %d%%     ", volume);
 }
 
 void setup()
@@ -102,15 +344,17 @@ void setup()
   delay(2500);
   Serial.println("boot");
 
-  // 初始化 I2S
-  setupI2S();
-  Serial.println("I2S ready");
+  // 初始化 I2S DAC
+  setupDAC();
+  Serial.println("DAC ready");
 
-  // 背光先拉高
+  // 初始化麦克风
+  setupMIC();
+
+  // 初始化屏幕
   pinMode(PIN_LCD_BL, OUTPUT);
   digitalWrite(PIN_LCD_BL, HIGH);
 
-  // 屏幕硬复位：RST 拉低再拉高
   pinMode(PIN_LCD_RST, OUTPUT);
   digitalWrite(PIN_LCD_RST, LOW);
   delay(20);
@@ -123,12 +367,8 @@ void setup()
   display.setRotation(LCD_ROTATION);
   display.setBrightness(255);
 
-  // 先全屏红色，确认有画面
-  display.fillScreen(TFT_RED);
-  delay(500);
-  display.fillScreen(TFT_WHITE);
-
-  display.setTextColor(TFT_BLACK);
+  display.fillScreen(TFT_BLACK);
+  display.setTextColor(TFT_WHITE);
   display.setTextSize(2);
   display.setCursor(20, display.height() / 2 - 10);
   display.print("Hello, Screen!");
@@ -139,16 +379,26 @@ void setup()
   delay(500);
   Serial.println("Playing greeting tone...");
   playSlideUp();
+  Serial.println("Greeting done. Starting spectrum display...");
+
+  // 显示 FFT 标题（只显示一次）
+  display.fillScreen(TFT_BLACK);
+  display.setTextColor(TFT_WHITE);
+  display.setTextSize(2);
+  display.setCursor(10, 10);
+  display.print("MIC FFT Spectrum");
 }
 
 void loop()
 {
-  display.setRotation(1);
-  display.fillScreen(TFT_RED);
-  delay(1000);
-  display.fillScreen(TFT_WHITE);
+  // 读取麦克风数据
+  if (readMicSamples())
+  {
+    // 计算 FFT
+    computeFFT();
+    // 绘制频谱
+    drawSpectrum();
+  }
 
-  display.setCursor(20, 20);
-  display.print("Rotation 1");
-  delay(1000);
+  yield();
 }
