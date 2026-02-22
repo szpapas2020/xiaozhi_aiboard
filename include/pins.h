@@ -10,8 +10,8 @@
 #include <Arduino.h>
 
 // ============ 按键引脚 ============
-#define PIN_BTN_RST 0     // RST 复位按键 (内置)
-#define PIN_BTN_BOOT 9    // BOOT 按键 - AI对话打断
+#define PIN_BTN_RST EN    // RST 复位按键 (内置)
+#define PIN_BTN_BOOT 0    // BOOT 按键 - AI对话打断
 #define PIN_BTN_VOL_UP 40 // VOL+ 音量加
 #define PIN_BTN_VOL_DN 39 // VOL- 音量减
 

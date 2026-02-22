@@ -42,6 +42,11 @@ static const i2s_port_t dac_i2s_port = I2S_NUM_0;
 #define SPECTRUM_Y 25       // Y 起始位置
 #define NUM_BARS 32         // 显示的频带数量
 
+// ============ 按键检测 ============
+bool lastBtnState = HIGH; // 上一次按键状态
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50; // 去抖延迟
+
 // 简单的正弦波生成（向上音调）
 void playTone(uint16_t frequency, uint32_t duration)
 {
@@ -79,6 +84,12 @@ void playSlideUp()
   {
     playTone(freq, duration_per_step);
   }
+}
+
+// 播放 "di" 声 (短促提示音)
+void playBeep()
+{
+  playTone(1000, 100); // 1kHz, 100ms
 }
 
 void setupDAC()
@@ -351,6 +362,9 @@ void setup()
   // 初始化麦克风
   setupMIC();
 
+  // 初始化按键 (GPIO 0)
+  pinMode(PIN_BTN_BOOT, INPUT_PULLUP);
+
   // 初始化屏幕
   pinMode(PIN_LCD_BL, OUTPUT);
   digitalWrite(PIN_LCD_BL, HIGH);
@@ -391,6 +405,24 @@ void setup()
 
 void loop()
 {
+  // 检测按键 (GPIO 0 拉低)
+  bool reading = digitalRead(PIN_BTN_BOOT);
+  if (reading != lastBtnState)
+  {
+    lastDebounceTime = millis();
+  }
+  lastBtnState = reading;
+
+  if ((millis() - lastDebounceTime) > debounceDelay)
+  {
+    if (reading == LOW) // 按键按下 (拉低)
+    {
+      Serial.println("Button pressed, playing beep...");
+      playBeep();
+      lastDebounceTime = millis() + 500; // 防止重复触发，延迟 500ms
+    }
+  }
+
   // 读取麦克风数据
   if (readMicSamples())
   {
