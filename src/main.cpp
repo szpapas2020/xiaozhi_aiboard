@@ -1,14 +1,30 @@
 /**
- * ESP32-S3 AI Board - 麦克风 FFT 频谱测试
- * 显示声音 FFT 频谱并播放问候音
+ * ESP32-S3 AI Board - 麦克风 FFT 频谱测试 + 网络音乐播放
+ * 显示声音 FFT 频谱并播放问候音，支持播放网络音乐
  */
 
 #include <Arduino.h>
 #include "lgfx_setup.h"
 #include "pins.h"
 #include <driver/i2s.h>
+#include <WiFi.h>
+#include <Audio.h>  // ESP32-audioI2S 库 - MP3 解码
 
 LGFX display;
+
+// ============ WiFi 配置 ============
+const char *WIFI_SSID = "9-404-2G&5G";     // 修改为你的 WiFi SSID
+const char *WIFI_PASSWORD = "sunkillytsn"; // 修改为你的 WiFi 密码
+
+// ============ 网络音乐流配置 ============
+// 一些可用的网络电台 URL 示例 (MP3 流)
+const char *RADIO_URLS[] = {
+    "http://stream.zeno.fm/f3wvbbqmdg8uv", // 轻音乐
+    "http://stream.zeno.fm/0r0xa792kwzuv", // 古典音乐
+    "http://stream.zeno.fm/vp0qxe0h7fdvv", // 流行音乐
+};
+const int NUM_RADIOS = sizeof(RADIO_URLS) / sizeof(RADIO_URLS[0]);
+int currentRadioIndex = 0;
 
 // ============ I2S 麦克风配置 ============
 #define MIC_I2S_PORT I2S_NUM_1
@@ -46,6 +62,19 @@ static const i2s_port_t dac_i2s_port = I2S_NUM_0;
 bool lastBtnState = HIGH; // 上一次按键状态
 unsigned long lastDebounceTime = 0;
 unsigned long debounceDelay = 50; // 去抖延迟
+unsigned long lastBtnPressTime = 0;
+
+// ============ 音频播放对象 ============
+Audio *audio = nullptr;
+bool isPlayingMusic = false;
+bool wifiConnected = false;
+
+// 函数声明
+void stopMusic();
+
+// 音频回调
+void audio_info(const char *info);
+void audio_id3data(BufferedData *buf);
 
 // 简单的正弦波生成（向上音调）
 void playTone(uint16_t frequency, uint32_t duration)
@@ -90,6 +119,96 @@ void playSlideUp()
 void playBeep()
 {
   playTone(1000, 100); // 1kHz, 100ms
+}
+
+// ============ WiFi 和网络音乐功能 ============
+
+// 连接 WiFi
+void connectWiFi()
+{
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED && timeout < 30)
+  {
+    delay(500);
+    Serial.print(".");
+    timeout++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    wifiConnected = true;
+  }
+  else
+  {
+    Serial.println("\nWiFi connection failed!");
+    wifiConnected = false;
+  }
+}
+
+// 播放网络电台
+void playRadio(int index)
+{
+  if (index < 0 || index >= NUM_RADIOS)
+    return;
+
+  Serial.print("Playing radio: ");
+  Serial.println(RADIO_URLS[index]);
+
+  if (audio == nullptr)
+  {
+    Serial.println("Audio not initialized!");
+    return;
+  }
+
+  // 停止当前播放
+  stopMusic();
+  
+  // 连接到新的电台
+  audio->connecttohost(RADIO_URLS[index]);
+  isPlayingMusic = true;
+  Serial.println("Connecting to radio stream...");
+}
+
+// 停止播放
+void stopMusic()
+{
+  if (isPlayingMusic && audio != nullptr)
+  {
+    audio->stopSong();
+    isPlayingMusic = false;
+    Serial.println("Music stopped");
+  }
+}
+
+// 切换电台
+void nextRadio()
+{
+  currentRadioIndex = (currentRadioIndex + 1) % NUM_RADIOS;
+  playRadio(currentRadioIndex);
+}
+
+// 音频信息回调
+void audio_info(const char *info)
+{
+  Serial.print("info: ");
+  Serial.println(info);
+}
+
+// 音频 ID3 数据回调
+void audio_id3data(BufferedData *buf)
+{
+  if (buf->pos)
+  {
+    Serial.printf("ID3: %s\n", buf->data);
+  }
 }
 
 void setupDAC()
@@ -359,6 +478,17 @@ void setup()
   setupDAC();
   Serial.println("DAC ready");
 
+  // 初始化音频播放 (使用 I2S_NUM_1 避免与麦克风冲突)
+  audio = new Audio(true, I2S_NUM_1);
+  audio->setPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
+  audio->setVolume(15);  // 音量 0-21
+  audio->infoCallback = audio_info;
+  audio->id3Callback = audio_id3data;
+  Serial.println("Audio player ready");
+
+  // 连接 WiFi
+  connectWiFi();
+
   // 初始化麦克风
   setupMIC();
 
@@ -401,10 +531,47 @@ void setup()
   display.setTextSize(2);
   display.setCursor(10, 10);
   display.print("MIC FFT Spectrum");
+
+  // 显示 WiFi 状态
+  display.setCursor(10, 30);
+  if (wifiConnected)
+  {
+    display.print("WiFi: Connected");
+  }
+  else
+  {
+    display.print("WiFi: Disconnected");
+  }
+  display.print("  Press BTN: Music");
+}
+
+// 显示播放状态
+void drawPlayStatus()
+{
+  display.fillRect(0, 30, 320, 20, TFT_BLACK);
+  display.setCursor(10, 30);
+  if (wifiConnected && isPlayingMusic)
+  {
+    display.printf("Playing: Radio %d  ", currentRadioIndex + 1);
+  }
+  else if (wifiConnected)
+  {
+    display.print("WiFi: Ready  Press BTN: Play  ");
+  }
+  else
+  {
+    display.print("WiFi: Disconnected  ");
+  }
 }
 
 void loop()
 {
+  // 处理音频播放 (MP3 解码)
+  if (audio != nullptr)
+  {
+    audio->loop();
+  }
+
   // 检测按键 (GPIO 0 拉低)
   bool reading = digitalRead(PIN_BTN_BOOT);
   if (reading != lastBtnState)
@@ -417,9 +584,27 @@ void loop()
   {
     if (reading == LOW) // 按键按下 (拉低)
     {
-      Serial.println("Button pressed, playing beep...");
-      playBeep();
-      lastDebounceTime = millis() + 500; // 防止重复触发，延迟 500ms
+      Serial.println("Button pressed...");
+
+      if (wifiConnected)
+      {
+        if (isPlayingMusic)
+        {
+          stopMusic();
+        }
+        else
+        {
+          playRadio(currentRadioIndex);
+        }
+      }
+      else
+      {
+        playBeep(); // WiFi 未连接时播放提示音
+      }
+
+      drawPlayStatus();
+      lastBtnPressTime = millis() + 500; // 防止重复触发，延迟 500ms
+      lastDebounceTime = lastBtnPressTime;
     }
   }
 
