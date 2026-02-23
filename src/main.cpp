@@ -8,7 +8,11 @@
 #include "pins.h"
 #include <driver/i2s.h>
 #include <WiFi.h>
-#include <Audio.h>  // ESP32-audioI2S 库 - MP3 解码
+#include <HTTPClient.h>
+#include "AudioFileSourceICYStream.h"
+#include "AudioFileSourceBuffer.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioOutputI2S.h"
 
 LGFX display;
 
@@ -17,7 +21,6 @@ const char *WIFI_SSID = "9-404-2G&5G";     // 修改为你的 WiFi SSID
 const char *WIFI_PASSWORD = "sunkillytsn"; // 修改为你的 WiFi 密码
 
 // ============ 网络音乐流配置 ============
-// 一些可用的网络电台 URL 示例 (MP3 流)
 const char *RADIO_URLS[] = {
     "http://stream.zeno.fm/f3wvbbqmdg8uv", // 轻音乐
     "http://stream.zeno.fm/0r0xa792kwzuv", // 古典音乐
@@ -43,13 +46,10 @@ double vReal[SAMPLE_COUNT];
 double vImag[SAMPLE_COUNT];
 int16_t samples[SAMPLE_COUNT];
 
-// ============ I2S 音频输出配置 ============
+// ============ I2S 音频输出配置 (用于 ESP8266Audio) ============
 #define I2S_BCLK_PIN PIN_I2S_BCLK // 15
 #define I2S_LRCK_PIN PIN_I2S_LRCK // 16
 #define I2S_DOUT_PIN PIN_I2S_DIN  // 7
-
-static const i2s_port_t dac_i2s_port = I2S_NUM_0;
-#define DAC_SAMPLE_RATE 16000
 
 // ============ 频谱显示参数 ============
 #define SPECTRUM_WIDTH 300  // 频谱宽度（几乎占满屏幕）
@@ -64,41 +64,112 @@ unsigned long lastDebounceTime = 0;
 unsigned long debounceDelay = 50; // 去抖延迟
 unsigned long lastBtnPressTime = 0;
 
-// ============ 音频播放对象 ============
-Audio *audio = nullptr;
+// ============ 音频播放状态 ============
+AudioFileSourceICYStream *file = nullptr;
+AudioFileSourceBuffer *buff = nullptr;
+AudioGeneratorMP3 *mp3 = nullptr;
+AudioOutputI2S *out = nullptr;
 bool isPlayingMusic = false;
 bool wifiConnected = false;
+unsigned long streamingStartTime = 0;
+const unsigned long STREAM_TIMEOUT = 10000; // 10 秒超时
+
+//  Called when a metadata event occurs (i.e. an ID3 tag, an ICY block, etc.
+void MDCallback(void *cbData, const char *type, bool isUnicode, const char *string) {
+  const char *ptr = reinterpret_cast<const char *>(cbData);
+  (void) isUnicode;
+  char s1[32], s2[64];
+  strncpy_P(s1, type, sizeof(s1));
+  s1[sizeof(s1) - 1] = 0;
+  strncpy_P(s2, string, sizeof(s2));
+  s2[sizeof(s2) - 1] = 0;
+  Serial.printf("METADATA(%s) '%s' = '%s'\n", ptr, s1, s2);
+  Serial.flush();
+}
+
+// Called when there's a warning or error (like a buffer underflow or decode hiccup)
+void StatusCallback(void *cbData, int code, const char *string) {
+  const char *ptr = reinterpret_cast<const char *>(cbData);
+  char s1[64];
+  strncpy_P(s1, string, sizeof(s1));
+  s1[sizeof(s1) - 1] = 0;
+  Serial.printf("STATUS(%s) '%d' = '%s'\n", ptr, code, s1);
+  Serial.flush();
+}
 
 // 函数声明
 void stopMusic();
 
-// 音频回调
-void audio_info(const char *info);
-void audio_id3data(BufferedData *buf);
-
-// 简单的正弦波生成（向上音调）
+// 简单的正弦波生成（使用 I2S 直接输出）
 void playTone(uint16_t frequency, uint32_t duration)
 {
-  int16_t sample;
-  uint32_t samples_count = (DAC_SAMPLE_RATE * duration) / 1000;
-  float phase = 0.0;
-  float phase_increment = (2.0 * PI * frequency) / DAC_SAMPLE_RATE;
+  Serial.printf("Playing tone: %dHz for %dms\n", frequency, duration);
+  
+  // 配置 I2S 用于音调生成
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = 22050,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = true,
+    .fixed_mclk = 0,
+    .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+    .bits_per_chan = I2S_BITS_PER_CHAN_16BIT
+  };
 
-  for (uint32_t i = 0; i < samples_count; i++)
-  {
-    sample = (int16_t)(sin(phase) * 32767 * 0.5);
+  i2s_pin_config_t pin_config = {
+    .mck_io_num = I2S_PIN_NO_CHANGE,
+    .bck_io_num = I2S_BCLK_PIN,
+    .ws_io_num = I2S_LRCK_PIN,
+    .data_out_num = I2S_DOUT_PIN,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+
+  // 安装 I2S 驱动
+  esp_err_t ret = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  if (ret != ESP_OK) {
+    Serial.printf("I2S tone install failed: %d\n", ret);
+    return;
+  }
+  
+  ret = i2s_set_pin(I2S_NUM_0, &pin_config);
+  if (ret != ESP_OK) {
+    Serial.printf("I2S set pin failed: %d\n", ret);
+    i2s_driver_uninstall(I2S_NUM_0);
+    return;
+  }
+
+  // 生成正弦波
+  uint32_t samples_count = (22050 * duration) / 1000;
+  float phase = 0.0;
+  float phase_increment = (2.0 * PI * frequency) / 22050;
+
+  for (uint32_t i = 0; i < samples_count; i++) {
+    int16_t sample = (int16_t)(sin(phase) * 32767 * 0.5);  // 50% 音量
     phase += phase_increment;
-    if (phase > 2 * PI)
-    {
+    if (phase > 2 * PI) {
       phase -= 2 * PI;
     }
 
-    uint32_t sample32 = (uint16_t)sample;
-    sample32 |= ((uint32_t)sample << 16);
+    // 立体声样本 - 左声道 + 右声道
+    uint32_t sample32 = ((uint32_t)sample << 16) | (uint16_t)sample;
 
-    size_t bytes_written;
-    i2s_write(dac_i2s_port, &sample32, sizeof(sample32), &bytes_written, portMAX_DELAY);
+    size_t bytes_written = 0;
+    ret = i2s_write(I2S_NUM_0, &sample32, sizeof(sample32), &bytes_written, portMAX_DELAY);
+    if (ret != ESP_OK) {
+      Serial.printf("I2S write failed: %d\n", ret);
+      break;
+    }
   }
+
+  // 卸载 I2S 驱动
+  i2s_driver_uninstall(I2S_NUM_0);
+  Serial.println("Tone done");
 }
 
 // 播放向上滑音
@@ -109,8 +180,7 @@ void playSlideUp()
   uint16_t end_freq = 880;
   uint16_t step = 20;
 
-  for (uint16_t freq = start_freq; freq <= end_freq; freq += step)
-  {
+  for (uint16_t freq = start_freq; freq <= end_freq; freq += step) {
     playTone(freq, duration_per_step);
   }
 }
@@ -118,7 +188,7 @@ void playSlideUp()
 // 播放 "di" 声 (短促提示音)
 void playBeep()
 {
-  playTone(1000, 100); // 1kHz, 100ms
+  playTone(1000, 100);  // 1kHz, 100ms
 }
 
 // ============ WiFi 和网络音乐功能 ============
@@ -162,29 +232,87 @@ void playRadio(int index)
   Serial.print("Playing radio: ");
   Serial.println(RADIO_URLS[index]);
 
-  if (audio == nullptr)
+  // 清理旧的音频对象
+  if (mp3 != nullptr)
   {
-    Serial.println("Audio not initialized!");
-    return;
+    mp3->stop();
+    delete mp3;
+    mp3 = nullptr;
+  }
+  if (buff != nullptr)
+  {
+    delete buff;
+    buff = nullptr;
+  }
+  if (file != nullptr)
+  {
+    delete file;
+    file = nullptr;
+  }
+  if (out != nullptr)
+  {
+    delete out;
+    out = nullptr;
   }
 
-  // 停止当前播放
-  stopMusic();
+  audioLogger = &Serial;
   
-  // 连接到新的电台
-  audio->connecttohost(RADIO_URLS[index]);
-  isPlayingMusic = true;
-  Serial.println("Connecting to radio stream...");
+  // 使用 ICY Stream 支持网络电台元数据
+  file = new AudioFileSourceICYStream(RADIO_URLS[index]);
+  file->RegisterMetadataCB(MDCallback, (void*)"ICY");
+  
+  // 创建 I2S 输出 (使用 I2S_NUM_0 避免与麦克风冲突)
+  out = new AudioOutputI2S(I2S_NUM_0);
+  out->SetPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
+  
+  // 创建 MP3 解码器
+  mp3 = new AudioGeneratorMP3();
+  mp3->RegisterStatusCB(StatusCallback, (void*)"mp3");
+  mp3->RegisterMetadataCB(MDCallback, (void*)"ICY");
+
+  Serial.println("Initializing MP3 decoder...");
+  if (mp3->begin(buff, out))
+  {
+    isPlayingMusic = true;
+    streamingStartTime = millis();
+    Serial.println("Streaming started successfully!");
+  }
+  else
+  {
+    Serial.println("Failed to initialize streaming!");
+    stopMusic();
+  }
 }
 
 // 停止播放
 void stopMusic()
 {
-  if (isPlayingMusic && audio != nullptr)
+  if (isPlayingMusic)
   {
-    audio->stopSong();
     isPlayingMusic = false;
     Serial.println("Music stopped");
+  }
+
+  if (mp3 != nullptr)
+  {
+    mp3->stop();
+    delete mp3;
+    mp3 = nullptr;
+  }
+  if (buff != nullptr)
+  {
+    delete buff;
+    buff = nullptr;
+  }
+  if (file != nullptr)
+  {
+    delete file;
+    file = nullptr;
+  }
+  if (out != nullptr)
+  {
+    delete out;
+    out = nullptr;
   }
 }
 
@@ -195,63 +323,10 @@ void nextRadio()
   playRadio(currentRadioIndex);
 }
 
-// 音频信息回调
-void audio_info(const char *info)
-{
-  Serial.print("info: ");
-  Serial.println(info);
-}
-
-// 音频 ID3 数据回调
-void audio_id3data(BufferedData *buf)
-{
-  if (buf->pos)
-  {
-    Serial.printf("ID3: %s\n", buf->data);
-  }
-}
-
-void setupDAC()
-{
-  i2s_config_t i2s_config = {
-      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-      .sample_rate = DAC_SAMPLE_RATE,
-      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-      .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-      .dma_buf_count = 8,
-      .dma_buf_len = 1024,
-      .use_apll = false,
-      .tx_desc_auto_clear = true,
-      .fixed_mclk = 0};
-
-  i2s_pin_config_t pin_config = {
-      .bck_io_num = I2S_BCLK_PIN,
-      .ws_io_num = I2S_LRCK_PIN,
-      .data_out_num = I2S_DOUT_PIN,
-      .data_in_num = I2S_PIN_NO_CHANGE};
-
-  esp_err_t ret = i2s_driver_install(dac_i2s_port, &i2s_config, 0, NULL);
-  if (ret != ESP_OK)
-  {
-    Serial.printf("DAC I2S driver install failed: %d\n", ret);
-    return;
-  }
-
-  ret = i2s_set_pin(dac_i2s_port, &pin_config);
-  if (ret != ESP_OK)
-  {
-    Serial.printf("DAC I2S set pin failed: %d\n", ret);
-    return;
-  }
-}
-
 void setupMIC()
 {
   Serial.println("Setting up MIC...");
 
-  // I2S 麦克风配置 (PDM 或 I2S 模式)
   i2s_config_t i2s_config = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
       .sample_rate = MIC_SAMPLE_RATE,
@@ -474,18 +549,6 @@ void setup()
   delay(2500);
   Serial.println("boot");
 
-  // 初始化 I2S DAC
-  setupDAC();
-  Serial.println("DAC ready");
-
-  // 初始化音频播放 (使用 I2S_NUM_1 避免与麦克风冲突)
-  audio = new Audio(true, I2S_NUM_1);
-  audio->setPinout(I2S_BCLK_PIN, I2S_LRCK_PIN, I2S_DOUT_PIN);
-  audio->setVolume(15);  // 音量 0-21
-  audio->infoCallback = audio_info;
-  audio->id3Callback = audio_id3data;
-  Serial.println("Audio player ready");
-
   // 连接 WiFi
   connectWiFi();
 
@@ -567,9 +630,19 @@ void drawPlayStatus()
 void loop()
 {
   // 处理音频播放 (MP3 解码)
-  if (audio != nullptr)
+  if (isPlayingMusic && mp3 != nullptr)
   {
-    audio->loop();
+    // 检查超时
+    if (millis() - streamingStartTime > STREAM_TIMEOUT)
+    {
+      Serial.println("Streaming timeout, stopping...");
+      stopMusic();
+    }
+    else if (!mp3->loop())
+    {
+      Serial.println("MP3 decoder stopped or stream ended");
+      stopMusic();
+    }
   }
 
   // 检测按键 (GPIO 0 拉低)
